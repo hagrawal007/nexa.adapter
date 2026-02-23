@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: Nexa.Adapter
+    runtime: docker
+    autoDeploy: true
+    healthCheckPath: /health
+
+    envVars:
+      # Render sets many default env vars automatically; you can add your own. [4](https://render.com/docs/configure-environment-variables)[5](https://render.com/docs/environment-variables)
+      - key: PORT
+        value: "10000"
+
+      # ASP.NET Core environment is controlled by DOTNET_ENVIRONMENT / ASPNETCORE_ENVIRONMENT. [6](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/environments?view=aspnetcore-10.0)
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: DOTNET_ENVIRONMENT
+        value: Production
