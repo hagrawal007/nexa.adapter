@@ -30,20 +30,26 @@ builder.Services.AddCors(options =>
     {
         policy
             .AllowAnyOrigin()
-            .AllowAnyMethod()
-            .AllowAnyHeader();
+            .AllowAnyHeader()
+            .AllowAnyMethod();
     });
 });
 
 
 builder.Services.AddControllers();
-builder.Services.AddHealthChecks();
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 builder.Services.Configure<LLMOptions>(builder.Configuration.GetSection("LLM"));
 builder.Services.Configure<BankDataApiOptions>(builder.Configuration.GetSection(BankDataApiOptions.configSectionName));
+
+builder.Services.AddSingleton<ITool, AccountLookupTool>();
+builder.Services.AddSingleton<ITool, TransactionSearchTool>();
+builder.Services.AddSingleton<ITool, WeatherTool>();
+builder.Services.AddSingleton<ITool, FetchUrlContentTool>();
+builder.Services.AddSingleton<ITool, CrmInsightsTool>();
+builder.Services.AddSingleton<ITool, CustomerBehaviourTool>();
 
 LLMProviderFactory.Register(builder.Services, builder.Configuration);
 
@@ -55,16 +61,14 @@ var app = builder.Build();
     app.UseSwagger();
     app.UseSwaggerUI();
 //}
+app.UseHttpsRedirection();
 app.UseCors("AllowAll");
 app.UseMiddleware<AuditMiddleware>();
 
-app.UseHttpsRedirection();
 
 app.UseAuthorization();
 
 app.MapControllers();
-
-app.MapHealthChecks("/health");
 
 app.Run();
 
