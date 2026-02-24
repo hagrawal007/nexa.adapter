@@ -24,6 +24,8 @@ builder.AddBankDataApiService();
 
 builder.Services.AddMemoryCache();
 
+builder.Services.AddHealthChecks();
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy =>
@@ -69,6 +71,10 @@ app.UseMiddleware<AuditMiddleware>();
 app.UseAuthorization();
 
 app.MapControllers();
+
+app.MapHealthChecks("/health")
+   .WithName("Health")
+   .WithTags("Health");
 
 app.Run();
 
