@@ -139,54 +139,114 @@ namespace Nexa.Adapter.Infrastructure.LLM
             var obj= _parser.Parse<LlmAnalysisResponse>(llmResponse);
             return obj;
         }
-        
+
         public async Task<NexaLlmResponse> CompleteChat(List<LlmMessage> messages, IEnumerable<ITool>? toolSpecs = null)
         {
-            string llmResponse = await InvokeLLM(messages, toolSpecs);
-            NexaLlmResponse obj= new NexaLlmResponse();
-            var (toolUse, text) = _parser.ExtractToolOrText(llmResponse);
-            if (toolUse != null && toolUse.Any())
+            const int maxRounds = 5;
+
+            for (int round = 0; round < maxRounds; round++)
             {
-                List<ToolResult> toolResults = new List<ToolResult>();
+                // ✅ Always include toolSpecs so the model can request tools again
+                string llmResponse = await InvokeLLM(messages, toolSpecs);
+
+                var (toolUse, text) = _parser.ExtractToolOrText(llmResponse);
+
+                // ✅ If model requested tools, execute them and continue loop
+                if (toolUse != null && toolUse.Any())
+                {
+                    var toolResults = new List<ToolResult>();
+
                     foreach (var toolCall in toolUse)
                     {
-                        var tool = _tools.FirstOrDefault(t => string.Equals(t.Name, toolCall.Name, System.StringComparison.OrdinalIgnoreCase));
-                        if (tool != null)
-                        {
-                         var inputList= JsonConvert.DeserializeObject<Dictionary<string, string>>(toolCall.Input);
-                        var result1 = await tool.ExecuteAsync(new ToolCall() { ToolName= toolCall.Name, Args= inputList });
-                            toolResults.Add(result1);
-                        }
-                        else
+                        var tool = _tools.FirstOrDefault(t =>
+                            string.Equals(t.Name, toolCall.Name, StringComparison.OrdinalIgnoreCase));
+
+                        if (tool == null)
                         {
                             toolResults.Add(new ToolResult { ToolName = toolCall.Name, Output = "Tool not found" });
+                            continue;
                         }
-                    }
-                messages.Add(new LlmMessage { Role = Role.Assistant, Content = JsonSerializer.Serialize(toolUse) });
-                if (toolResults.Any())
-                {
-                    messages.Add(new LlmMessage { Role = Role.Assistant, Content = $"This is tool execution result, Please respond as per user query. Tool results:\n{JsonSerializer.Serialize(toolResults)}" });
-                }
-                var resultAfterToolCall = await InvokeLLM(messages);
-             var (tools, textResult) = _parser.ExtractToolOrText(resultAfterToolCall);
-             string cleanedJson = textResult
-            .Replace("```json", "", StringComparison.OrdinalIgnoreCase)
-            .Replace("```", "")
-            .Trim();
-                obj = JsonConvert.DeserializeObject<NexaLlmResponse>(cleanedJson);
 
+                        // ✅ FIX: tool input may contain numbers/bools; don't deserialize to Dictionary<string,string>
+                        var argsObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(toolCall.Input ?? "{}")
+                                     ?? new Dictionary<string, object>();
+
+                        var inputList = argsObj.ToDictionary(k => k.Key, v => v.Value?.ToString() ?? "");
+
+                        toolResults.Add(await tool.ExecuteAsync(new ToolCall
+                        {
+                            ToolName = toolCall.Name,
+                            Args = inputList
+                        }));
+                    }
+
+                    // Keep conversation context for the model
+                    messages.Add(new LlmMessage { Role = Role.Assistant, Content = JsonSerializer.Serialize(toolUse) });
+
+                    // Strongly instruct model to now return final JSON object
+                    messages.Add(new LlmMessage
+                    {
+                        Role = Role.Assistant,
+                        Content =
+                            "TOOL_RESULTS:\n" + JsonSerializer.Serialize(toolResults) +
+                            "\n\nNow respond ONLY with a single JSON object that matches NexaLlmResponse schema. Do NOT return an array."
+                    });
+
+                    continue; // next round (model might request another tool or return final JSON)
+                }
+
+                // ✅ Final answer path (no toolUse)
+                var cleaned = ExtractJsonObject(text);
+
+                cleaned = _parser.PrependThinkingToResponse(cleaned);
+
+                var obj = JsonConvert.DeserializeObject<NexaLlmResponse>(cleaned);
+                if (obj == null) throw new InvalidOperationException("Final response deserialized to null.");
+                return obj;
             }
-            else
-            {
-             string cleanedJson = text
-            .Replace("```json", "", StringComparison.OrdinalIgnoreCase)
-            .Replace("```", "")
-            .Trim();
-                cleanedJson = _parser.PrependThinkingToResponse(cleanedJson);
-             obj = JsonConvert.DeserializeObject<NexaLlmResponse>(cleanedJson);
-            }
-            return obj;
+
+            throw new InvalidOperationException($"Exceeded max tool rounds ({maxRounds}).");
         }
+
+        private static string ExtractJsonObject(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                throw new InvalidOperationException("Expected JSON object but model returned empty text.");
+
+            var s = text.Replace("```json", "", StringComparison.OrdinalIgnoreCase)
+                        .Replace("```", "")
+                        .Trim();
+
+            // Remove <thinking> blocks if present
+            s = System.Text.RegularExpressions.Regex.Replace(
+                s, @"<thinking>.*?</thinking>", "",
+                System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            ).Trim();
+
+            // If model returned array here, that's NOT a NexaLlmResponse object — throw a clear error
+            var t = s.TrimStart();
+            if (t.StartsWith("["))
+                throw new InvalidOperationException("Model returned a JSON array when a NexaLlmResponse JSON object was expected:\n" + s);
+
+            // If already an object
+            if (t.StartsWith("{")) return s;
+
+            // Otherwise, extract first JSON object from mixed text
+            int start = s.IndexOf('{');
+            if (start < 0) throw new InvalidOperationException("No JSON object found in model output:\n" + s);
+
+            int depth = 0;
+            for (int i = start; i < s.Length; i++)
+            {
+                if (s[i] == '{') depth++;
+                else if (s[i] == '}') depth--;
+
+                if (depth == 0)
+                    return s.Substring(start, i - start + 1).Trim();
+            }
+
+            throw new InvalidOperationException("Unbalanced JSON braces in model output:\n" + s);
+        }        
     }
 
     public class AwsResponseParser : ILLMResponseParser
@@ -317,8 +377,50 @@ namespace Nexa.Adapter.Infrastructure.LLM
                 }
             }
 
+            // ✅ Fallback: tool call list returned as TEXT (JSON array) instead of toolUse blocks
+            if (lstTools.Count == 0 && !string.IsNullOrWhiteSpace(text))
+            {
+                var trimmed = text.TrimStart();
+
+                // looks like JSON array
+                if (trimmed.StartsWith("["))
+                {
+                    try
+                    {
+                        var calls = JsonConvert.DeserializeObject<List<ToolUseText>>(text);
+
+                        if (calls != null && calls.Any() && calls.All(c => !string.IsNullOrWhiteSpace(c.Name)))
+                        {
+                            lstTools.AddRange(calls.Select(c => new ToolUse
+                            {
+                                Name = c.Name,
+                                ToolUseId = c.ToolUseId,
+                                Input = c.Input
+                            }));
+
+                            text = ""; // clear text because it was actually tool requests
+                        }
+                    }
+                    catch
+                    {
+                        // ignore - it wasn't tool calls
+                    }
+                }
+            }
+
+
             return (lstTools, text);
         }
+
+
+        private class ToolUseText
+        {
+            [JsonProperty("Name")] public string Name { get; set; } = "";
+            [JsonProperty("ToolUseId")] public string ToolUseId { get; set; } = "";
+            [JsonProperty("Input")] public string Input { get; set; } = "";
+        }
+
+
         private static string ExtractText(string json)
         {
             using var doc = JsonDocument.Parse(json);
